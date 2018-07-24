@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+const (
+	K int = 1024
+	M int = 1024 * 1024
+	G int = 1024 * 1024 * 1024
+)
+
 type logFileList []string
 
 func (l logFileList) Less(i, j int) bool {
