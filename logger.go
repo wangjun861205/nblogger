@@ -55,6 +55,10 @@ func NewIntervalLogger(path string, interval time.Duration, format int, prefix s
 	if err != nil {
 		return nil, err
 	}
+	err = cleanLogFiles(path, keepNum)
+	if err != nil {
+		return nil, err
+	}
 	f, err := newLogFile(path)
 	if err != nil {
 		return nil, err
@@ -113,6 +117,10 @@ type FixedSizeLogger struct {
 
 func NewFixedSizeLogger(path, prefix string, format int, keepNum int, interval time.Duration, sizeLimit int) (*FixedSizeLogger, error) {
 	err := mkdirIfNotExists(path)
+	if err != nil {
+		return nil, err
+	}
+	err = cleanLogFiles(path, keepNum)
 	if err != nil {
 		return nil, err
 	}
