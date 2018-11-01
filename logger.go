@@ -1,226 +1,239 @@
 package nblogger
 
 import (
-	"io/ioutil"
-	"log"
-	"os"
-	"path/filepath"
-	"sort"
-	"strconv"
+	"context"
+	"database/sql"
+	"fmt"
+	"reflect"
 	"strings"
+	"sync"
 	"time"
+	"unsafe"
+
+	"github.com/wangjun861205/nborm"
 )
 
-const (
-	K int = 1024
-	M int = 1024 * 1024
-	G int = 1024 * 1024 * 1024
-)
-
-type logFileList []string
-
-func (l logFileList) Less(i, j int) bool {
-	iName := strings.Replace(strings.Replace(l[i], "_", "", -1), ".log", "", -1)
-	jName := strings.Replace(strings.Replace(l[j], "_", "", -1), ".log", "", -1)
-	iNum, _ := strconv.ParseInt(iName, 10, 64)
-	jNum, _ := strconv.ParseInt(jName, 10, 64)
-	return iNum < jNum
+type Logger struct {
+	db          *sql.DB
+	fieldMap    map[string][]fieldInfo
+	fieldLock   sync.RWMutex
+	stmtMap     map[string]*sql.Stmt
+	stmtLock    sync.RWMutex
+	watchCtx    context.Context
+	cancelWatch context.CancelFunc
+	watcherWG   sync.WaitGroup
 }
 
-func (l logFileList) Len() int {
-	return len(l)
-}
-
-func (l logFileList) Swap(i, j int) {
-	l[i], l[j] = l[j], l[i]
-}
-
-type Logger interface {
-	Log(interface{})
-	Stop()
-}
-
-type IntervalLogger struct {
-	inputChan    chan interface{}
-	stopChan     chan interface{}
-	intervalChan <-chan time.Time
-	path         string
-	logger       *log.Logger
-	file         *os.File
-	keepNum      int
-}
-
-func NewIntervalLogger(path string, interval time.Duration, format int, prefix string, keepNum int) (*IntervalLogger, error) {
-	err := mkdirIfNotExists(path)
+func NewLogger(username, password, address, database string) (*Logger, error) {
+	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", username, password, address, database))
 	if err != nil {
 		return nil, err
 	}
-	err = cleanLogFiles(path, keepNum)
-	if err != nil {
-		return nil, err
+	nborm.RegisterDB(username, password, address, "information_schema")
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Logger{
+		db:          db,
+		fieldMap:    make(map[string][]fieldInfo),
+		stmtMap:     make(map[string]*sql.Stmt),
+		watchCtx:    ctx,
+		cancelWatch: cancel,
+	}, nil
+}
+
+func (logger *Logger) Register(obj interface{}, keepTime time.Duration) error {
+	typ := reflect.TypeOf(obj)
+	for typ.Kind() == reflect.Ptr || typ.Kind() == reflect.Interface {
+		typ = typ.Elem()
 	}
-	f, err := newLogFile(path)
-	if err != nil {
-		return nil, err
+	if typ.Kind() != reflect.Struct {
+		return fmt.Errorf("nborm.Register() error: only struct can be registered")
 	}
-	inputChan := make(chan interface{})
-	stopChan := make(chan interface{})
-	logger := log.New(f, prefix, format)
-	intervalChan := time.Tick(interval)
-	intervalLogger := &IntervalLogger{inputChan, stopChan, intervalChan, path, logger, f, keepNum}
-	intervalLogger.start()
-	return intervalLogger, nil
-}
-
-func (logger *IntervalLogger) start() {
-	go func() {
-		for {
-			select {
-			case <-logger.intervalChan:
-				logger.file.Close()
-				newFile, err := newLogFile(logger.path)
-				if err != nil {
-					return
-				}
-				logger.logger.SetOutput(newFile)
-				logger.file = newFile
-				cleanLogFiles(logger.path, logger.keepNum)
-			case msg := <-logger.inputChan:
-				logger.logger.Println(msg)
-			case <-logger.stopChan:
-				logger.file.Close()
-				close(logger.inputChan)
-				return
-			}
-		}
-	}()
-}
-
-func (logger *IntervalLogger) Log(msg interface{}) {
-	logger.inputChan <- msg
-}
-
-func (logger *IntervalLogger) Stop() {
-	close(logger.stopChan)
-}
-
-type FixedSizeLogger struct {
-	path         string
-	keepNum      int
-	inputChan    chan interface{}
-	stopChan     chan interface{}
-	intervalChan <-chan time.Time
-	logger       *log.Logger
-	file         *os.File
-	sizeLimit    int
-}
-
-func NewFixedSizeLogger(path, prefix string, format int, keepNum int, interval time.Duration, sizeLimit int) (*FixedSizeLogger, error) {
-	err := mkdirIfNotExists(path)
-	if err != nil {
-		return nil, err
-	}
-	err = cleanLogFiles(path, keepNum)
-	if err != nil {
-		return nil, err
-	}
-	f, err := newLogFile(path)
-	if err != nil {
-		return nil, err
-	}
-	inputChan := make(chan interface{})
-	stopChan := make(chan interface{})
-	intervalChan := time.Tick(interval)
-	logger := log.New(f, prefix, format)
-	fixedLogger := &FixedSizeLogger{path, keepNum, inputChan, stopChan, intervalChan, logger, f, sizeLimit}
-	fixedLogger.start()
-	return fixedLogger, nil
-}
-
-func (logger *FixedSizeLogger) start() {
-	go func() {
-		for {
-			select {
-			case <-logger.intervalChan:
-				info, _ := logger.file.Stat()
-				size := info.Size()
-				if size > int64(logger.sizeLimit) {
-					logger.file.Close()
-					newFile, _ := newLogFile(logger.path)
-					logger.logger.SetOutput(newFile)
-					logger.file = newFile
-					cleanLogFiles(logger.path, logger.keepNum)
-				}
-			case msg := <-logger.inputChan:
-				logger.logger.Println(msg)
-			case <-logger.stopChan:
-				logger.file.Close()
-				close(logger.inputChan)
-				return
-			}
-		}
-	}()
-}
-
-func (logger *FixedSizeLogger) Stop() {
-	close(logger.stopChan)
-}
-
-func (logger *FixedSizeLogger) Log(msg interface{}) {
-	logger.inputChan <- msg
-}
-
-func newLogFile(path string) (*os.File, error) {
-	filename := time.Now().Format("2006_01_02_15_04_05") + ".log"
-	return os.OpenFile(filepath.Join(path, filename), os.O_CREATE|os.O_WRONLY, 0755)
-}
-
-func cleanLogFiles(path string, keepNum int) error {
-	infos, err := ioutil.ReadDir(path)
+	exist, err := logger.tableExists(typ)
 	if err != nil {
 		return err
 	}
-	logFiles := make(logFileList, 0, len(infos))
-	for _, info := range infos {
-		if !info.IsDir() && info.Name()[len(info.Name())-4:] == ".log" {
-			logFiles = append(logFiles, info.Name())
+	if exist {
+		if err := checkTable(typ); err != nil {
+			return err
 		}
-	}
-	if len(logFiles) > keepNum {
-		sort.Sort(logFiles)
-		for _, filename := range logFiles[:len(logFiles)-keepNum] {
-			err := os.Remove(filepath.Join(path, filename))
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func mkdirIfNotExists(path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			err = os.MkdirAll(path, 0775)
-			if err != nil {
-				return err
-			}
-		}
-		return err
-	}
-	if !info.IsDir() {
-		err = os.MkdirAll(path, 0775)
+	} else {
+		err := logger.createTable(typ)
 		if err != nil {
 			return err
 		}
 	}
+	fieldList := make([]fieldInfo, typ.NumField())
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		fieldList[i].name = field.Name
+		fieldList[i].typ = field.Type.String()
+		fieldList[i].offset = field.Offset
+	}
+	logger.fieldLock.Lock()
+	logger.fieldMap[typ.Name()] = fieldList
+	logger.fieldLock.Unlock()
+	logger.watcherWG.Add(1)
+	go func() {
+		ticker := time.NewTicker(keepTime)
+		for {
+			select {
+			case <-logger.watchCtx.Done():
+				ticker.Stop()
+				logger.watcherWG.Done()
+				return
+			case now := <-ticker.C:
+				_, err := logger.db.Exec(fmt.Sprintf("DELETE FROM %s WHERE log_time < ?", typ.Name()),
+					now.Truncate(keepTime).Format("2006-01-02 15:04:05"))
+				if err != nil {
+					fmt.Println(err.Error())
+					ticker.Stop()
+					logger.watcherWG.Done()
+					return
+				}
+			}
+		}
+	}()
 	return nil
 }
 
-func NewLogger(path, prefix string, format int, interval time.Duration, sizeLimit int, keepNum int) (Logger, error) {
-	if sizeLimit > 0 {
-		return NewFixedSizeLogger(path, prefix, format, keepNum, interval, sizeLimit)
+func (logger *Logger) Log(obj interface{}) error {
+	typ := reflect.TypeOf(obj)
+	for typ.Kind() == reflect.Ptr || typ.Kind() == reflect.Interface {
+		typ = typ.Elem()
 	}
-	return NewIntervalLogger(path, interval, format, prefix, keepNum)
+	logger.fieldLock.RLock()
+	fieldList, exists := logger.fieldMap[typ.Name()]
+	if !exists {
+		return fmt.Errorf("nblogger.Log() error: register struct before log")
+	}
+	val := reflect.ValueOf(obj)
+	start := val.Pointer()
+	colList := make([]string, typ.NumField())
+	valList := make([]interface{}, typ.NumField())
+	for i, field := range fieldList {
+		colList[i] = field.name
+		p := unsafe.Pointer(start + field.offset)
+		switch field.typ {
+		case "string":
+			v := (*string)(p)
+			valList[i] = *v
+		case "int":
+			v := (*int)(p)
+			valList[i] = *v
+		case "int8":
+			v := (*int8)(p)
+			valList[i] = *v
+		case "int16":
+			v := (*int16)(p)
+			valList[i] = *v
+		case "int32":
+			v := (*int32)(p)
+			valList[i] = *v
+		case "int64":
+			v := (*int64)(p)
+			valList[i] = *v
+		case "uint":
+			v := (*uint)(p)
+			valList[i] = *v
+		case "uint8":
+			v := (*uint8)(p)
+			valList[i] = *v
+		case "uint16":
+			v := (*uint16)(p)
+			valList[i] = *v
+		case "uint32":
+			v := (*uint32)(p)
+			valList[i] = *v
+		case "uint64":
+			v := (*uint64)(p)
+			valList[i] = *v
+		case "float32":
+			v := (*float32)(p)
+			valList[i] = *v
+		case "float64":
+			v := (*float64)(p)
+			valList[i] = *v
+		case "bool":
+			v := (*bool)(p)
+			valList[i] = *v
+		case "time.Time":
+			v := (*time.Time)(p)
+			valList[i] = v.Format("2006-01-02 15:04:05")
+		default:
+			return fmt.Errorf("nborm.Log() error: not supported type (%s)", field.typ)
+		}
+	}
+	var stmt *sql.Stmt
+	logger.stmtLock.RLock()
+	var ok bool
+	stmt, ok = logger.stmtMap[typ.Name()]
+	if !ok {
+		var err error
+		stmt, err = logger.db.Prepare(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", typ.Name(), strings.Join(colList, ", "),
+			strings.Join(strings.Fields(strings.Repeat("? ", len(fieldList))), ", ")))
+		if err != nil {
+			return err
+		}
+		logger.stmtLock.RUnlock()
+		logger.stmtLock.Lock()
+		logger.stmtMap[typ.Name()] = stmt
+		logger.stmtLock.Unlock()
+		_, err = stmt.Exec(valList...)
+		return err
+	}
+	logger.stmtLock.RUnlock()
+	_, err := stmt.Exec(valList...)
+	return err
+}
+
+func (logger *Logger) ShutDown() error {
+	logger.stmtLock.Lock()
+	defer logger.stmtLock.Unlock()
+	for _, stmt := range logger.stmtMap {
+		err := stmt.Close()
+		if err != nil {
+			return err
+		}
+	}
+	logger.cancelWatch()
+	logger.watcherWG.Wait()
+	err := nborm.CloseConns()
+	if err != nil {
+		return err
+	}
+	return logger.db.Close()
+
+}
+
+func (logger *Logger) tableExists(typ reflect.Type) (bool, error) {
+	var n int
+	row := logger.db.QueryRow("SELECT 1 FROM information_schema.tables WHERE table_name = ?", typ.Name())
+	err := row.Scan(&n)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (logger *Logger) createTable(typ reflect.Type) error {
+	pk := "id"
+	builder := strings.Builder{}
+	builder.WriteString(fmt.Sprintf("CREATE TABLE %s ( id INT NOT NULL AUTO_INCREMENT, ", typ.Name()))
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if _, exist := field.Tag.Lookup("primary_key"); exist {
+			pk = field.Name
+		}
+		colType, exist := goToSQLType[field.Type.String()]
+		if !exist {
+			return fmt.Errorf("nblogger.createTable() error: not supported type (%s)", field.Type.String())
+		}
+		builder.WriteString(fmt.Sprintf("%s %s NOT NULL, ", field.Name, colType))
+	}
+	builder.WriteString(fmt.Sprintf("log_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (%s))", pk))
+	_, err := logger.db.Exec(builder.String())
+	return err
 }
